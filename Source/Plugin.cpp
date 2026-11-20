@@ -8,7 +8,7 @@ enum Param
     crushOn, bits, crushMix, reduceOn, rate, reduceMix, repeatOn, repeatRate, repeatMix,
     repeatTrigger, gateOn, gateRate, depth, pattern, pitchOn, pitch, pitchMix, reverseOn,
     reverseRate, reverseMix, reverseMode, reverseTrigger, input, output, mix, hpOn,
-    hp, lpOn, lp, bypass, crusherOn, crusherMix, repeatRandom, reverseRandom, count
+    hp, lpOn, lp, bypass, crusherOn, crusherMix, repeatRandom, reverseRandom, chopperRandom, count
 };
 
 enum class Kind { knob, toggle, choice };
@@ -26,7 +26,7 @@ struct Definition
 
 constexpr Definition definitions[] {
     {"crushOn", "Bitcrusher On", Kind::toggle, 0},
-    {"bits", "Bits", Kind::knob, 16, 1, 24, 1, "bit"},
+    {"bits", "Bits", Kind::knob, 8, 1, 24, 1, "bit"},
     {"crushMix", "Bitcrusher Mix", Kind::knob, 100, 0, 100, 0.1f, "%"},
     {"reduceOn", "Sample Rate Reducer On", Kind::toggle, 0},
     {"rate", "Sample Rate", Kind::knob, 12000, 500, 48000, 1, "Hz", true},
@@ -58,7 +58,8 @@ constexpr Definition definitions[] {
     {"crusherOn", "Crusher On", Kind::toggle, 0},
     {"crusherMix", "Crusher Mix", Kind::knob, 100, 0, 100, 0.1f, "%"},
     {"repeatRandom", "Repeater Random Trigger", Kind::toggle, 0},
-    {"reverseRandom", "Reverser Random Trigger", Kind::toggle, 0}
+    {"reverseRandom", "Reverser Random Trigger", Kind::toggle, 0},
+    {"chopperRandom", "Chopper Random Trigger", Kind::toggle, 0}
 };
 static_assert(std::size(definitions) == count);
 
@@ -110,7 +111,7 @@ struct Preset
 };
 
 const Preset presets[] {
-    {"Clean", {}},
+    {"Init", {}},
     {"8-Bit Vocal", {{crushOn, 1.0f}, {bits, 8.0f}}},
     {"Digital Crunch", {{crushOn, 1.0f}, {bits, 5.0f}, {reduceOn, 1.0f}, {rate, 7000.0f}}},
     {"Machine Gun", {{repeatOn, 1.0f}, {repeatRate, 3.0f}}},
@@ -198,6 +199,13 @@ public:
         for (auto [id, value] : presets[selected].values)
             values[id] = value;
         values[crusherOn] = values[crushOn] > 0.5f || values[reduceOn] > 0.5f ? 1.0f : 0.0f;
+        if (values[crusherOn] > 0.5f)
+        {
+            if (values[crushOn] <= 0.5f)
+                values[bits] = definitions[bits].high;
+            if (values[reduceOn] <= 0.5f)
+                values[rate] = definitions[rate].high;
+        }
         for (int i = 0; i < count; ++i)
         {
             auto* parameter = state.getParameter(definitions[i].id);
@@ -261,7 +269,19 @@ public:
                     if (auto cutoff = parameterNode(pair.second); cutoff.isValid())
                         cutoff.setProperty("value", definitions[pair.second].initial, nullptr);
         }
-        for (const auto id : {repeatRandom, reverseRandom})
+        if (!parameterNode(chopperRandom).isValid())
+        {
+            const bool crushing = float(parameterNode(crushOn).getProperty("value", 0)) > 0.5f;
+            const bool reducing = float(parameterNode(reduceOn).getProperty("value", 0)) > 0.5f;
+            if (auto stageBits = parameterNode(bits); stageBits.isValid())
+            {
+                if (!crushing)
+                    stageBits.setProperty("value", reducing ? definitions[bits].high : definitions[bits].initial, nullptr);
+            }
+            if (auto stageRate = parameterNode(rate); stageRate.isValid() && crushing && !reducing)
+                stageRate.setProperty("value", definitions[rate].high, nullptr);
+        }
+        for (const auto id : {repeatRandom, reverseRandom, chopperRandom})
             if (!parameterNode(id).isValid())
             {
                 juce::ValueTree node("PARAM");
@@ -444,7 +464,6 @@ void Processor::render(juce::AudioBuffer<float>& buffer, bool hostBypass)
     }
     for (const auto& pair : {std::pair{hpOn, hp}, std::pair{lpOn, lp}})
         smooth[pair.first].setTargetValue(setting[pair.second] != definitions[pair.second].initial ? 1.0f : 0.0f);
-    const bool defaultCrusher = setting[crushOn] <= 0.5f && setting[reduceOn] <= 0.5f;
     const int repeatLength = divisionLength(bpm, int(setting[repeatRate]));
     const int reverseLength = divisionLength(bpm, int(setting[reverseRate]));
     const int pitchLatency = setting[pitchOn] > 0.5f ? grain / 2 + 2 : 0;
@@ -477,6 +496,11 @@ void Processor::render(juce::AudioBuffer<float>& buffer, bool hostBypass)
     const bool randomRepeat = hasRepeat && setting[repeatRandom] > 0.5f;
     const bool randomReverse = hasReverse && setting[reverseRandom] > 0.5f;
     const auto repeatGrid = std::ldexp(1.0, int(setting[repeatRate]));
+    const int crushBits = int(std::lround(setting[bits]));
+    const bool randomChopper = setting[chopperRandom] > 0.5f;
+    const int chopperPattern = int(setting[pattern]);
+    const int chopperDivision = int(setting[gateRate]);
+    const auto chopperGrid = std::ldexp(1.0, chopperDivision) * (chopperPattern == 2 ? 1.5 : 1.0);
     const auto reverseGrid = std::ldexp(1.0, int(setting[reverseRate]));
     const bool reverseContinuous = setting[reverseMode] < 0.5f && !randomReverse;
     const auto crushRelease = static_cast<float>(std::exp(-1.0 / (sr * 0.035)));
@@ -496,8 +520,8 @@ void Processor::render(juce::AudioBuffer<float>& buffer, bool hostBypass)
         const auto gainOut = juce::Decibels::decibelsToGain(smooth[output].getNextValue());
         const auto globalMix = smooth[mix].getNextValue() * 0.01f;
         const auto globalBypass = smooth[bypass].getNextValue();
-        const auto crushAmount = (defaultCrusher ? 1.0f : smooth[crushOn].getNextValue()) * smooth[crushMix].getNextValue() * 0.01f;
-        const auto reduceAmount = (defaultCrusher ? 1.0f : smooth[reduceOn].getNextValue()) * smooth[reduceMix].getNextValue() * 0.01f;
+        const auto crushAmount = smooth[crushMix].getNextValue() * 0.01f;
+        const auto reduceAmount = smooth[reduceMix].getNextValue() * 0.01f;
         const auto crusherAmount = smooth[crusherOn].getNextValue() * smooth[crusherMix].getNextValue() * 0.01f;
         const auto reduceRate = smooth[rate].getNextValue();
         const bool repeating = manualRepeat
@@ -528,10 +552,10 @@ void Processor::render(juce::AudioBuffer<float>& buffer, bool hostBypass)
                         if (crusherAmount > 0.0f)
                         {
                             auto processed = wet;
-                            if (crushAmount > 0.0f)
+                            if (crushAmount > 0.0f && crushBits < int(definitions[bits].high))
                                 processed = vocal::blend(processed, crushEffect.process(processed,
-                                    defaultCrusher ? 8 : int(setting[bits]), crushRelease), crushAmount);
-                            if (reduceAmount > 0.0f)
+                                    crushBits, crushRelease), crushAmount);
+                            if (reduceAmount > 0.0f && reduceRate < definitions[rate].high - 0.5f)
                                 processed = vocal::blend(processed, reduceEffect.process(processed,
                                     juce::jmin(1.0, reduceRate / sr)), reduceAmount);
                             wet = vocal::blend(wet, processed, crusherAmount);
@@ -549,7 +573,8 @@ void Processor::render(juce::AudioBuffer<float>& buffer, bool hostBypass)
                     case chopper:
                         if (gateAmount > 0.0f)
                         {
-                            const auto target = vocal::GateChopperProcessor::target(beat, int(setting[gateRate]), int(setting[pattern]));
+                            const bool chop = !randomChopper || randomHit(std::floor(beat * chopperGrid), 0x88be420du);
+                            const auto target = chop ? vocal::GateChopperProcessor::target(beat, chopperDivision, chopperPattern) : 1.0f;
                             gateEnvelope += gateSlew * (target - gateEnvelope);
                             for (auto& sample : wet)
                                 sample *= 1.0f - gateAmount * (1.0f - gateEnvelope);
@@ -674,6 +699,23 @@ public:
         return label;
     }
 
+    void drawComboBox(juce::Graphics& g, int w, int h, bool down, int, int, int, int, juce::ComboBox& box) override
+    {
+        bevel(g, {0, 0, w, h}, juce::Colour(0xffc0c0c0), down);
+        juce::Path arrow;
+        const float cy = float(h) * 0.5f;
+        arrow.addTriangle(6.0f, cy - 2.0f, 12.0f, cy - 2.0f, 9.0f, cy + 2.0f);
+        g.setColour(juce::Colours::black.withAlpha(box.isEnabled() ? 1.0f : 0.5f));
+        g.fillPath(arrow);
+    }
+
+    void positionComboBoxText(juce::ComboBox& box, juce::Label& label) override
+    {
+        label.setBounds(16, 1, box.getWidth() - 18, box.getHeight() - 2);
+        label.setFont(juce::Font(juce::FontOptions(11.0f)));
+        label.setBorderSize(juce::BorderSize<int>(0));
+    }
+
     void drawButtonBackground(juce::Graphics& g, juce::Button& button, const juce::Colour&,
                               bool highlighted, bool down) override
     {
@@ -694,7 +736,7 @@ public:
         if (icon == power)
         {
             const bool active = getToggleState() != reverseSense;
-            g.setColour(juce::Colour(active ? 0xff003e85 : 0xff505050));
+            g.setColour(juce::Colour(active ? 0xff003e85 : reverseSense ? 0xffbd1818 : 0xff505050));
             juce::Path path;
             path.addCentredArc(centre.x, centre.y + 0.7f, 4.8f, 4.8f, 0.0f, 0.62f, 5.66f, true);
             g.strokePath(path, juce::PathStrokeType(1.45f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
@@ -716,6 +758,14 @@ private:
     bool reverseSense;
 };
 
+class BypassShade final : public juce::Component
+{
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(juce::Colour(0xffa6a6a6).withAlpha(0.66f));
+    }
+};
+
 class Editor final : public juce::AudioProcessorEditor, private juce::Timer
 {
     using State = juce::AudioProcessorValueTreeState;
@@ -728,7 +778,7 @@ class Editor final : public juce::AudioProcessorEditor, private juce::Timer
         std::unique_ptr<State::ComboBoxAttachment> combo;
     };
     static constexpr int width = 1006, height = 334, visibleCount = 5;
-    static constexpr Param enables[] {crushOn, reduceOn, repeatOn, gateOn, pitchOn, reverseOn};
+    static constexpr Param enables[] {crusherOn, reduceOn, repeatOn, gateOn, pitchOn, reverseOn};
     static constexpr const char* titles[] {"CRUSHER", "", "REPEATER", "CHOPPER", "SHIFTER", "REVERSER"};
 
 public:
@@ -754,7 +804,7 @@ public:
         canvas.setInterceptsMouseClicks(false, true);
         addAndMakeVisible(canvas);
         for (int i = 0; i < count; ++i)
-            if (i > reduceMix && i != hpOn && i != lpOn)
+            if ((i > reduceMix || i == bits || i == rate) && i != hpOn && i != lpOn)
                 createControl(static_cast<Param>(i));
         presetBox.setName("Presets");
         presetBox.setTooltip("Open Factory and User preset folders");
@@ -769,6 +819,10 @@ public:
                            static_cast<juce::Component*>(&previousPreset),
                            static_cast<juce::Component*>(&nextPreset)})
             canvas.addAndMakeVisible(item);
+        canvas.addChildComponent(bypassShade);
+        auto& bypassButton = static_cast<juce::TextButton&>(*controls[bypass].component);
+        bypassButton.toFront(false);
+        bypassButton.onClick = [this] { bypassShade.setVisible(on(bypass)); };
         displayedRoute = processor.getRoute();
         canvas.setBounds(0, 0, width, height);
         setResizable(true, true);
@@ -794,7 +848,6 @@ public:
         g.setColour(Color(0xff000080));
         g.setFont(juce::Font(juce::FontOptions(41.0f, juce::Font::bold | juce::Font::italic)));
         g.drawText("VOCAL DMG", juce::Rectangle<int>{18, 13, 360, 49}, juce::Justification::centredLeft);
-        label(g, "Drag module headers to change signal order", {19, 63, 340, 16}, 12.0f, false, false);
 
         const char* leftLabels[] {"Bits", "Rate", "Rate", "Rate", "Pitch", "Length"};
         const auto route = visibleRoute();
@@ -806,10 +859,12 @@ public:
             RackStyle::bevel(g, box, Color(0xffe6e6e6), true);
             RackStyle::bevel(g, box.withHeight(29).reduced(1, 1),
                              Color(slot == dropSlot || slot == dragSlot ? 0xffaab7dc : 0xffc0c0c0));
-            label(g, juce::String(slot + 1) + "  " + titles[module], {x + 9, y + 3, 130, 22}, 13.0f, true, false);
+            label(g, juce::String(slot + 1) + ".  " + titles[module], {x + 9, y + 3, 130, 22}, 13.0f, true, false);
             if (module == crusher)
             {
-                label(g, "Mix", {x + 66, y + 49, 58, 16}, 12.0f, false, true);
+                label(g, "Bits", {x + 5, y + 49, 54, 16}, 12.0f, false, true);
+                label(g, "Sample Rate", {x + 57, y + 49, 75, 16}, 11.0f, false, true);
+                label(g, "Mix", {x + 137, y + 49, 48, 16}, 12.0f, false, true);
             }
             else
             {
@@ -833,6 +888,7 @@ public:
         presetBox.setBounds(699, 27, 193, 26);
         nextPreset.setBounds(895, 27, 29, 26);
         place(bypass, {936, 27, 48, 26});
+        bypassShade.setBounds(canvas.getLocalBounds());
         const Param left[] {bits, rate, repeatRate, gateRate, pitch, reverseRate};
         const Param right[] {crushMix, reduceMix, repeatMix, depth, pitchMix, reverseMix};
         const auto route = visibleRoute();
@@ -840,13 +896,16 @@ public:
         {
             const auto module = route[slot];
             const int x = panel(slot).getX(), y = panel(slot).getY();
+            place(enables[module], {x + 140, y + 4, 40, 20});
             if (module == crusher)
             {
-                place(crusherOn, {x + 140, y + 4, 40, 20});
-                place(crusherMix, {x + 66, y + 65, 58, 60});
+
+                place(bits, {x + 5, y + 65, 54, 60});
+                place(rate, {x + 65, y + 65, 60, 60});
+                place(crusherMix, {x + 137, y + 65, 48, 60});
                 continue;
             }
-            place(enables[module], {x + 156, y + 4, 24, 20});
+
             place(left[module], {x + 15, y + 65, 74, 60});
             place(right[module], {x + 114, y + 65, 49, 60});
             if (module == repeater)
@@ -855,7 +914,10 @@ public:
                 place(repeatRandom, {x + 98, y + 129, 65, 22});
             }
             if (module == chopper)
-                place(pattern, {x + 35, y + 129, 113, 22});
+            {
+                place(pattern, {x + 17, y + 129, 94, 22});
+                place(chopperRandom, {x + 120, y + 129, 54, 22});
+            }
             if (module == reverser)
             {
                 place(reverseMode, {x + 5, y + 129, 77, 22});
@@ -971,12 +1033,12 @@ private:
         if (d.kind == Kind::toggle)
         {
             const bool trigger = id == repeatTrigger || id == reverseTrigger;
-            const bool power = id == bypass || std::find(std::begin(enables), std::end(enables), id) != std::end(enables);
+            const bool power = id == bypass;
             std::unique_ptr<juce::TextButton> button;
             if (power)
                 button = std::make_unique<IconButton>(IconButton::power, id == bypass);
             else
-                button = std::make_unique<juce::TextButton>(trigger ? "Trigger" : (id == repeatRandom || id == reverseRandom) ? "Random" : "Off");
+                button = std::make_unique<juce::TextButton>(trigger ? "Trigger" : (id == repeatRandom || id == reverseRandom || id == chopperRandom) ? "Random" : "Off");
             button->setClickingTogglesState(true);
             if (id == reverseTrigger)
             {
@@ -988,6 +1050,7 @@ private:
             }
             button->setTooltip(id == repeatTrigger ? "Latch the most recent fragment. Click again to release."
                 : id == reverseTrigger ? "Capture and reverse the next fragment in Trigger mode." : id == repeatRandom ? "Randomly repeats fragments on the selected note grid."
+                : id == chopperRandom ? "Randomly chops selected steps. Depth controls the amount."
                 : id == reverseRandom ? "Randomly triggers one-shot reverses on the selected note grid."
                 : d.name);
             control.button = std::make_unique<State::ButtonAttachment>(processor.state, d.id, *button);
@@ -1047,7 +1110,12 @@ private:
     void timerCallback() override
     {
         updatePresetLabel();
-        static_cast<juce::TextButton&>(*controls[crusherOn].component).setButtonText(on(crusherOn) ? "On" : "Off");
+        bypassShade.setVisible(on(bypass));
+        for (const auto module : visibleRoute())
+        {
+            const auto id = enables[module];
+            static_cast<juce::TextButton&>(*controls[id].component).setButtonText(on(id) ? "On" : "Off");
+        }
         const auto route = processor.getRoute();
         if (dragSlot < 0 && route != displayedRoute)
         {
@@ -1065,7 +1133,7 @@ private:
         const auto selected = processor.program.load();
         const auto labelText = selected >= 0 ? processor.getProgramName(selected)
                               : userPresetName.isNotEmpty() ? userPresetName : "User preset";
-        presetBox.setButtonText(labelText + "  " + juce::String::charToString(0x25be));
+        presetBox.setButtonText(juce::String::charToString(0x25be) + "  " + labelText);
     }
 
     static juce::File presetFolder()
@@ -1172,6 +1240,7 @@ private:
     Processor& processor;
     RackStyle style;
     juce::Component canvas;
+    BypassShade bypassShade;
     std::array<Control, count> controls;
     Route displayedRoute = decodeRoute(defaultRoute);
     int dragSlot = -1, dropSlot = -1;
@@ -1186,6 +1255,7 @@ juce::AudioProcessorEditor* Processor::createEditor() { return new Editor(*this)
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new Processor; }
+
 
 
 
